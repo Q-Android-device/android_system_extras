@@ -1273,6 +1273,141 @@ class TestBinaryCacheBuilder(TestBase):
         self.assertTrue(filecmp.cmp(target_file, source_file))
 
 
+class TestApiProfiler(TestBase):
+    def run_api_test(self, package_name, apk_name, expected_reports, min_android_version):
+        adb = AdbHelper()
+        if adb.get_android_version() < ord(min_android_version) - ord('L') + 5:
+            log_info('skip this test on Android < %s.' % min_android_version)
+            return
+        # step 1: Prepare profiling.
+        self.run_cmd(['api_profiler.py', 'prepare'])
+        # step 2: Install and run the app.
+        apk_path = os.path.join('testdata', apk_name)
+        adb.run(['uninstall', package_name])
+        adb.check_run(['install', '-t', apk_path])
+        adb.check_run(['shell', 'am', 'start', '-n', package_name + '/.MainActivity'])
+        # step 3: Wait until the app exits.
+        time.sleep(4)
+        while True:
+            result = adb.run(['shell', 'pidof', package_name])
+            if not result:
+                break
+            time.sleep(1)
+        # step 4: Collect recording data.
+        remove('simpleperf_data')
+        self.run_cmd(['api_profiler.py', 'collect', '-p', package_name, '-o', 'simpleperf_data'])
+        # step 5: Check recording data.
+        names = os.listdir('simpleperf_data')
+        self.assertGreater(len(names), 0)
+        for name in names:
+            path = os.path.join('simpleperf_data', name)
+            remove('report.txt')
+            self.run_cmd(['report.py', '-g', '-o', 'report.txt', '-i', path])
+            self.check_strings_in_file('report.txt', expected_reports)
+        # step 6: Clean up.
+        remove('report.txt')
+        remove('simpleperf_data')
+        adb.check_run(['uninstall', package_name])
+
+    def run_cpp_api_test(self, apk_name, min_android_version):
+        self.run_api_test('simpleperf.demo.cpp_api', apk_name, ['BusyThreadFunc'],
+                          min_android_version)
+
+    def test_cpp_api_on_a_debuggable_app_targeting_prev_q(self):
+        # The source code of the apk is in simpleperf/demo/CppApi (with a small change to exit
+        # after recording).
+        self.run_cpp_api_test('cpp_api-debug_prev_Q.apk', 'N')
+
+    def test_cpp_api_on_a_debuggable_app_targeting_q(self):
+        self.run_cpp_api_test('cpp_api-debug_Q.apk', 'N')
+
+    def test_cpp_api_on_a_profileable_app_targeting_prev_q(self):
+        # a release apk with <profileable android:shell="true" />
+        self.run_cpp_api_test('cpp_api-profile_prev_Q.apk', 'Q')
+
+    def test_cpp_api_on_a_profileable_app_targeting_q(self):
+        self.run_cpp_api_test('cpp_api-profile_Q.apk', 'Q')
+
+    def run_java_api_test(self, apk_name, min_android_version):
+        self.run_api_test('simpleperf.demo.java_api', apk_name,
+                          ['simpleperf.demo.java_api.MainActivity', 'java.lang.Thread.run'],
+                          min_android_version)
+
+    def test_java_api_on_a_debuggable_app_targeting_prev_q(self):
+        # The source code of the apk is in simpleperf/demo/JavaApi (with a small change to exit
+        # after recording).
+        self.run_java_api_test('java_api-debug_prev_Q.apk', 'P')
+
+    def test_java_api_on_a_debuggable_app_targeting_q(self):
+        self.run_java_api_test('java_api-debug_Q.apk', 'P')
+
+    def test_java_api_on_a_profileable_app_targeting_prev_q(self):
+        # a release apk with <profileable android:shell="true" />
+        self.run_java_api_test('java_api-profile_prev_Q.apk', 'Q')
+
+    def test_java_api_on_a_profileable_app_targeting_q(self):
+        self.run_java_api_test('java_api-profile_Q.apk', 'Q')
+
+
+class TestPprofProtoGenerator(TestBase):
+    def setUp(self):
+        if not HAS_GOOGLE_PROTOBUF:
+            raise unittest.SkipTest(
+                'Skip test for pprof_proto_generator because google.protobuf is missing')
+
+    def run_generator(self, options=None, testdata_file='perf_with_interpreter_frames.data'):
+        testdata_path = os.path.join('testdata', testdata_file)
+        options = options or []
+        self.run_cmd(['pprof_proto_generator.py', '-i', testdata_path] + options)
+        return self.run_cmd(['pprof_proto_generator.py', '--show'], return_output=True)
+
+    def test_show_art_frames(self):
+        art_frame_str = 'art::interpreter::DoCall'
+        # By default, don't show art frames.
+        self.assertNotIn(art_frame_str, self.run_generator())
+        # Use --show_art_frames to show art frames.
+        self.assertIn(art_frame_str, self.run_generator(['--show_art_frames']))
+
+    def test_pid_filter(self):
+        key = 'PlayScene::DoFrame()'  # function in process 10419
+        self.assertIn(key, self.run_generator())
+        self.assertIn(key, self.run_generator(['--pid', '10419']))
+        self.assertIn(key, self.run_generator(['--pid', '10419', '10416']))
+        self.assertNotIn(key, self.run_generator(['--pid', '10416']))
+
+    def test_tid_filter(self):
+        key1 = 'art::ProfileSaver::Run()'  # function in thread 10459
+        key2 = 'PlayScene::DoFrame()'  # function in thread 10463
+        for options in ([], ['--tid', '10459', '10463']):
+            output = self.run_generator(options)
+            self.assertIn(key1, output)
+            self.assertIn(key2, output)
+        output = self.run_generator(['--tid', '10459'])
+        self.assertIn(key1, output)
+        self.assertNotIn(key2, output)
+        output = self.run_generator(['--tid', '10463'])
+        self.assertNotIn(key1, output)
+        self.assertIn(key2, output)
+
+    def test_comm_filter(self):
+        key1 = 'art::ProfileSaver::Run()'  # function in thread 'Profile Saver'
+        key2 = 'PlayScene::DoFrame()'  # function in thread 'e.sample.tunnel'
+        for options in ([], ['--comm', 'Profile Saver', 'e.sample.tunnel']):
+            output = self.run_generator(options)
+            self.assertIn(key1, output)
+            self.assertIn(key2, output)
+        output = self.run_generator(['--comm', 'Profile Saver'])
+        self.assertIn(key1, output)
+        self.assertNotIn(key2, output)
+        output = self.run_generator(['--comm', 'e.sample.tunnel'])
+        self.assertNotIn(key1, output)
+        self.assertIn(key2, output)
+
+    def test_build_id(self):
+        """ Test the build ids generated are not padded with zeros. """
+        self.assertIn('build_id: e3e938cc9e40de2cfe1a5ac7595897de(', self.run_generator())
+
+
 def get_all_tests():
     tests = []
     for name, value in globals().items():
