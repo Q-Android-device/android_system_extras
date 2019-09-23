@@ -302,7 +302,7 @@ class PprofProfileGenerator(object):
             sample.add_value(sample_type_id, 1)
             sample.add_value(sample_type_id + 1, report_sample.period)
             if self._filter_symbol(symbol):
-                location_id = self.get_location_id(symbol.vaddr_in_file, symbol)
+                location_id = self.get_location_id(report_sample.ip, symbol)
                 sample.add_location_id(location_id)
             for i in range(callchain.nr):
                 entry = callchain.entries[i]
