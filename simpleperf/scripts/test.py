@@ -59,11 +59,43 @@ from utils import is_python3, is_windows, Objdump, ReadElf, remove, SourceFileSe
 try:
     # pylint: disable=unused-import
     import google.protobuf
+    # pylint: disable=ungrouped-imports
+    from pprof_proto_generator import load_pprof_profile
     HAS_GOOGLE_PROTOBUF = True
 except ImportError:
     HAS_GOOGLE_PROTOBUF = False
 
 INFERNO_SCRIPT = os.path.join(get_script_dir(), "inferno.bat" if is_windows() else "./inferno.sh")
+
+class TestLogger(object):
+    """ Write test progress in sys.stderr and keep verbose log in log file. """
+    def __init__(self):
+        self.log_file = self.get_log_file(3 if is_python3() else 2)
+        if os.path.isfile(self.log_file):
+            remove(self.log_file)
+        # Logs can come from multiple processes. So use append mode to avoid overwrite.
+        self.log_fh = open(self.log_file, 'a')
+        logging.basicConfig(filename=self.log_file)
+
+    @staticmethod
+    def get_log_file(python_version):
+        return 'test_python_%d.log' % python_version
+
+    def writeln(self, s):
+        return self.write(s + '\n')
+
+    def write(self, s):
+        sys.stderr.write(s)
+        self.log_fh.write(s)
+        # Child processes can also write to log file, so flush it immediately to keep the order.
+        self.flush()
+
+    def flush(self):
+        self.log_fh.flush()
+
+
+TEST_LOGGER = TestLogger()
+
 
 def get_device_features():
     adb = AdbHelper()
@@ -80,6 +112,13 @@ def is_trace_offcpu_supported():
     return is_trace_offcpu_supported.value
 
 
+def android_version():
+    """ Get Android version on device, like 7 is for Android N, 8 is for Android O."""
+    if not hasattr(android_version, 'value'):
+        android_version.value = AdbHelper().get_android_version()
+    return android_version.value
+
+
 def build_testdata():
     """ Collect testdata from ../testdata and ../demo. """
     from_testdata_path = os.path.join('..', 'testdata')
@@ -88,16 +127,12 @@ def build_testdata():
     if (not os.path.isdir(from_testdata_path) or not os.path.isdir(from_demo_path) or
             not from_script_testdata_path):
         return
-    copy_testdata_list = ['perf_with_symbols.data', 'perf_with_trace_offcpu.data',
-                          'perf_with_tracepoint_event.data', 'perf_with_interpreter_frames.data']
     copy_demo_list = ['SimpleperfExamplePureJava', 'SimpleperfExampleWithNative',
                       'SimpleperfExampleOfKotlin']
 
     testdata_path = "testdata"
     remove(testdata_path)
-    os.mkdir(testdata_path)
-    for testdata in copy_testdata_list:
-        shutil.copy(os.path.join(from_testdata_path, testdata), testdata_path)
+    shutil.copytree(from_testdata_path, testdata_path)
     for demo in copy_demo_list:
         shutil.copytree(os.path.join(from_demo_path, demo), os.path.join(testdata_path, demo))
     for f in os.listdir(from_script_testdata_path):
@@ -150,10 +185,9 @@ class TestExampleBase(TestBase):
         cls.adb_root = adb_root
         cls.compiled = False
         cls.has_perf_data_for_report = False
-        android_version = cls.adb.get_android_version()
         # On Android >= P (version 9), we can profile JITed and interpreted Java code.
         # So only compile Java code on Android <= O (version 8).
-        cls.use_compiled_java_code = android_version <= 8
+        cls.use_compiled_java_code = android_version() <= 8
 
     def setUp(self):
         if self.id().find('TraceOffCpu') != -1 and not is_trace_offcpu_supported():
@@ -576,8 +610,13 @@ class TestExampleWithNative(TestExampleBase):
              "__start_thread"])
 
     def test_pprof_proto_generator(self):
+        check_strings_with_lines = [
+            "native-lib.cpp",
+            "BusyLoopThread",
+            # Check if dso name in perf.data is replaced by binary path in binary_cache.
+            'filename: binary_cache/data/app/com.example.simpleperf.simpleperfexamplewithnative-']
         self.common_test_pprof_proto_generator(
-            check_strings_with_lines=["native-lib.cpp", "BusyLoopThread"],
+            check_strings_with_lines,
             check_strings_without_lines=["BusyLoopThread"])
 
     def test_inferno(self):
@@ -1273,6 +1312,200 @@ class TestBinaryCacheBuilder(TestBase):
         self.assertTrue(filecmp.cmp(target_file, source_file))
 
 
+class TestApiProfiler(TestBase):
+    def run_api_test(self, package_name, apk_name, expected_reports, min_android_version):
+        adb = AdbHelper()
+        if android_version() < ord(min_android_version) - ord('L') + 5:
+            log_info('skip this test on Android < %s.' % min_android_version)
+            return
+        # step 1: Prepare profiling.
+        self.run_cmd(['api_profiler.py', 'prepare'])
+        # step 2: Install and run the app.
+        apk_path = os.path.join('testdata', apk_name)
+        adb.run(['uninstall', package_name])
+        adb.check_run(['install', '-t', apk_path])
+        adb.check_run(['shell', 'am', 'start', '-n', package_name + '/.MainActivity'])
+        # step 3: Wait until the app exits.
+        time.sleep(4)
+        while True:
+            result = adb.run(['shell', 'pidof', package_name])
+            if not result:
+                break
+            time.sleep(1)
+        # step 4: Collect recording data.
+        remove('simpleperf_data')
+        self.run_cmd(['api_profiler.py', 'collect', '-p', package_name, '-o', 'simpleperf_data'])
+        # step 5: Check recording data.
+        names = os.listdir('simpleperf_data')
+        self.assertGreater(len(names), 0)
+        for name in names:
+            path = os.path.join('simpleperf_data', name)
+            remove('report.txt')
+            self.run_cmd(['report.py', '-g', '-o', 'report.txt', '-i', path])
+            self.check_strings_in_file('report.txt', expected_reports)
+        # step 6: Clean up.
+        remove('report.txt')
+        remove('simpleperf_data')
+        adb.check_run(['uninstall', package_name])
+
+    def run_cpp_api_test(self, apk_name, min_android_version):
+        self.run_api_test('simpleperf.demo.cpp_api', apk_name, ['BusyThreadFunc'],
+                          min_android_version)
+
+    def test_cpp_api_on_a_debuggable_app_targeting_prev_q(self):
+        # The source code of the apk is in simpleperf/demo/CppApi (with a small change to exit
+        # after recording).
+        self.run_cpp_api_test('cpp_api-debug_prev_Q.apk', 'N')
+
+    def test_cpp_api_on_a_debuggable_app_targeting_q(self):
+        self.run_cpp_api_test('cpp_api-debug_Q.apk', 'N')
+
+    def test_cpp_api_on_a_profileable_app_targeting_prev_q(self):
+        # a release apk with <profileable android:shell="true" />
+        self.run_cpp_api_test('cpp_api-profile_prev_Q.apk', 'Q')
+
+    def test_cpp_api_on_a_profileable_app_targeting_q(self):
+        self.run_cpp_api_test('cpp_api-profile_Q.apk', 'Q')
+
+    def run_java_api_test(self, apk_name, min_android_version):
+        self.run_api_test('simpleperf.demo.java_api', apk_name,
+                          ['simpleperf.demo.java_api.MainActivity', 'java.lang.Thread.run'],
+                          min_android_version)
+
+    def test_java_api_on_a_debuggable_app_targeting_prev_q(self):
+        # The source code of the apk is in simpleperf/demo/JavaApi (with a small change to exit
+        # after recording).
+        self.run_java_api_test('java_api-debug_prev_Q.apk', 'P')
+
+    def test_java_api_on_a_debuggable_app_targeting_q(self):
+        self.run_java_api_test('java_api-debug_Q.apk', 'P')
+
+    def test_java_api_on_a_profileable_app_targeting_prev_q(self):
+        # a release apk with <profileable android:shell="true" />
+        self.run_java_api_test('java_api-profile_prev_Q.apk', 'Q')
+
+    def test_java_api_on_a_profileable_app_targeting_q(self):
+        self.run_java_api_test('java_api-profile_Q.apk', 'Q')
+
+
+class TestPprofProtoGenerator(TestBase):
+    def setUp(self):
+        if not HAS_GOOGLE_PROTOBUF:
+            raise unittest.SkipTest(
+                'Skip test for pprof_proto_generator because google.protobuf is missing')
+
+    def run_generator(self, options=None, testdata_file='perf_with_interpreter_frames.data'):
+        testdata_path = os.path.join('testdata', testdata_file)
+        options = options or []
+        self.run_cmd(['pprof_proto_generator.py', '-i', testdata_path] + options)
+        return self.run_cmd(['pprof_proto_generator.py', '--show'], return_output=True)
+
+    def test_show_art_frames(self):
+        art_frame_str = 'art::interpreter::DoCall'
+        # By default, don't show art frames.
+        self.assertNotIn(art_frame_str, self.run_generator())
+        # Use --show_art_frames to show art frames.
+        self.assertIn(art_frame_str, self.run_generator(['--show_art_frames']))
+
+    def test_pid_filter(self):
+        key = 'PlayScene::DoFrame()'  # function in process 10419
+        self.assertIn(key, self.run_generator())
+        self.assertIn(key, self.run_generator(['--pid', '10419']))
+        self.assertIn(key, self.run_generator(['--pid', '10419', '10416']))
+        self.assertNotIn(key, self.run_generator(['--pid', '10416']))
+
+    def test_tid_filter(self):
+        key1 = 'art::ProfileSaver::Run()'  # function in thread 10459
+        key2 = 'PlayScene::DoFrame()'  # function in thread 10463
+        for options in ([], ['--tid', '10459', '10463']):
+            output = self.run_generator(options)
+            self.assertIn(key1, output)
+            self.assertIn(key2, output)
+        output = self.run_generator(['--tid', '10459'])
+        self.assertIn(key1, output)
+        self.assertNotIn(key2, output)
+        output = self.run_generator(['--tid', '10463'])
+        self.assertNotIn(key1, output)
+        self.assertIn(key2, output)
+
+    def test_comm_filter(self):
+        key1 = 'art::ProfileSaver::Run()'  # function in thread 'Profile Saver'
+        key2 = 'PlayScene::DoFrame()'  # function in thread 'e.sample.tunnel'
+        for options in ([], ['--comm', 'Profile Saver', 'e.sample.tunnel']):
+            output = self.run_generator(options)
+            self.assertIn(key1, output)
+            self.assertIn(key2, output)
+        output = self.run_generator(['--comm', 'Profile Saver'])
+        self.assertIn(key1, output)
+        self.assertNotIn(key2, output)
+        output = self.run_generator(['--comm', 'e.sample.tunnel'])
+        self.assertNotIn(key1, output)
+        self.assertIn(key2, output)
+
+    def test_build_id(self):
+        """ Test the build ids generated are not padded with zeros. """
+        self.assertIn('build_id: e3e938cc9e40de2cfe1a5ac7595897de(', self.run_generator())
+
+    def test_location_address(self):
+        """ Test if the address of a location is within the memory range of the corresponding
+            mapping.
+        """
+        self.run_cmd(['pprof_proto_generator.py', '-i',
+                      os.path.join('testdata', 'perf_with_interpreter_frames.data')])
+
+        profile = load_pprof_profile('pprof.profile')
+        # pylint: disable=no-member
+        for location in profile.location:
+            mapping = profile.mapping[location.mapping_id - 1]
+            self.assertLessEqual(mapping.memory_start, location.address)
+            self.assertGreaterEqual(mapping.memory_limit, location.address)
+
+
+class TestRecordingRealApps(TestBase):
+    def setUp(self):
+        self.adb = AdbHelper(False)
+        self.installed_packages = []
+
+    def tearDown(self):
+        for package in self.installed_packages:
+            self.adb.run(['shell', 'pm', 'uninstall', package])
+
+    def install_apk(self, apk_path, package_name):
+        self.adb.run(['install', '-t', apk_path])
+        self.installed_packages.append(package_name)
+
+    def start_app(self, start_cmd):
+        subprocess.Popen(self.adb.adb_path + ' ' + start_cmd, shell=True,
+                         stdout=TEST_LOGGER.log_fh, stderr=TEST_LOGGER.log_fh)
+
+    def record_data(self, package_name, record_arg):
+        self.run_cmd(['app_profiler.py', '--app', package_name, '-r', record_arg])
+
+    def check_symbol_in_record_file(self, symbol_name):
+        self.run_cmd(['report.py', '--children', '-o', 'report.txt'])
+        self.check_strings_in_file('report.txt', [symbol_name])
+
+    def test_recording_displaybitmaps(self):
+        self.install_apk(os.path.join('testdata', 'DisplayBitmaps.apk'),
+                         'com.example.android.displayingbitmaps')
+        self.install_apk(os.path.join('testdata', 'DisplayBitmapsTest.apk'),
+                         'com.example.android.displayingbitmaps.test')
+        self.start_app('shell am instrument -w -r -e debug false -e class ' +
+                       'com.example.android.displayingbitmaps.tests.GridViewTest ' +
+                       'com.example.android.displayingbitmaps.test/' +
+                       'androidx.test.runner.AndroidJUnitRunner')
+        self.record_data('com.example.android.displayingbitmaps', '-e cpu-clock -g --duration 10')
+        if android_version() >= 9:
+            self.check_symbol_in_record_file('androidx.test.espresso')
+
+    def test_recording_endless_tunnel(self):
+        self.install_apk(os.path.join('testdata', 'EndlessTunnel.apk'), 'com.google.sample.tunnel')
+        self.start_app('shell am start -n com.google.sample.tunnel/android.app.NativeActivity -a ' +
+                       'android.intent.action.MAIN -c android.intent.category.LAUNCHER')
+        self.record_data('com.google.sample.tunnel', '-e cpu-clock -g --duration 10')
+        self.check_symbol_in_record_file('PlayScene::DoFrame')
+
+
 def get_all_tests():
     tests = []
     for name, value in globals().items():
@@ -1284,12 +1517,17 @@ def get_all_tests():
     return sorted(tests)
 
 
-def run_tests(tests):
+def run_tests(tests, repeats):
     os.chdir(get_script_dir())
     build_testdata()
-    log_info('Run tests with python%d\n%s' % (3 if is_python3() else 2, '\n'.join(tests)))
     argv = [sys.argv[0]] + tests
     unittest.main(argv=argv, failfast=True, verbosity=2, exit=False)
+    for repeat in range(repeats):
+        log_info('Run tests with python %d for %dth time\n%s' % (
+            3 if is_python3() else 2, repeat + 1, '\n'.join(tests)))
+        test_program = unittest.main(argv=argv, failfast=True, verbosity=2, exit=False)
+        if not test_program.result.wasSuccessful():
+            sys.exit(1)
 
 
 def main():
@@ -1298,6 +1536,7 @@ def main():
     parser.add_argument('--test-from', nargs=1, help='Run left tests from the selected test.')
     parser.add_argument('--python-version', choices=['2', '3', 'both'], default='both', help="""
                         Run tests on which python versions.""")
+    parser.add_argument('--repeat', type=int, nargs=1, default=1, help='run test multiple times')
     parser.add_argument('pattern', nargs='*', help='Run tests matching the selected pattern.')
     args = parser.parse_args()
     tests = get_all_tests()
@@ -1324,6 +1563,10 @@ def main():
     if AdbHelper().get_android_version() < 7:
         log_info("Skip tests on Android version < N.")
         sys.exit(0)
+		
+    if android_version() < 7:
+        print("Skip tests on Android version < N.", file=TEST_LOGGER)
+        return False
 
     if args.python_version == 'both':
         python_versions = [2, 3]
@@ -1338,7 +1581,7 @@ def main():
             argv += ['--python-version', str(version)]
             subprocess.check_call(argv)
         else:
-            run_tests(tests)
+            run_tests(tests, args.repeat[0])
 
 
 if __name__ == '__main__':
