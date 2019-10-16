@@ -82,9 +82,9 @@ if [ -z $SIZE ]; then
 fi
 
 if [ "$SPARSE_IMG" = "false" ]; then
-  FALLOCATE_CMD="fallocate -l $SIZE $OUTPUT_FILE"
-  echo $FALLOCATE_CMD
-  $FALLOCATE_CMD
+  TRUNCATE_CMD="truncate -s $SIZE $OUTPUT_FILE"
+  echo $TRUNCATE_CMD
+  $TRUNCATE_CMD
   if [ $? -ne 0 ]; then
     exit 3
   fi
