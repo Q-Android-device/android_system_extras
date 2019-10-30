@@ -744,6 +744,66 @@ TEST(record_cmd, cpu_percent_option) {
   ASSERT_FALSE(RunRecordCmd({"--cpu-percent", "101"}));
 }
 
+class RecordingAppHelper {
+ public:
+  bool InstallApk(const std::string& apk_path, const std::string& package_name) {
+    if (Workload::RunCmd({"pm", "install", "-t", "--abi", GetABI(), apk_path})) {
+      installed_packages_.emplace_back(package_name);
+      return true;
+    }
+    return false;
+  }
+
+  bool StartApp(const std::string& start_cmd) {
+    app_start_proc_ = Workload::CreateWorkload(android::base::Split(start_cmd, " "));
+    return app_start_proc_ && app_start_proc_->Start();
+  }
+
+  bool RecordData(const std::string& record_cmd) {
+    std::vector<std::string> args = android::base::Split(record_cmd, " ");
+    args.emplace_back("-o");
+    args.emplace_back(perf_data_file_.path);
+    return RecordCmd()->Run(args);
+  }
+
+  bool CheckData(const std::function<bool(const char*)>& process_symbol) {
+    bool success = false;
+    auto callback = [&](const Symbol& symbol, uint32_t) {
+      if (process_symbol(symbol.DemangledName())) {
+        success = true;
+      }
+      return success;
+    };
+    ProcessSymbolsInPerfDataFile(perf_data_file_.path, callback);
+    return success;
+  }
+
+  ~RecordingAppHelper() {
+    for (auto& package : installed_packages_) {
+      Workload::RunCmd({"pm", "uninstall", package});
+    }
+  }
+
+ private:
+  const char* GetABI() {
+#if defined(__i386__)
+    return "x86";
+#elif defined(__x86_64__)
+    return "x86_64";
+#elif defined(__aarch64__)
+    return "arm64-v8a";
+#elif defined(__arm__)
+    return "armeabi-v7a";
+#else
+    #error "unrecognized ABI"
+#endif
+  }
+
+  std::vector<std::string> installed_packages_;
+  std::unique_ptr<Workload> app_start_proc_;
+  TemporaryFile perf_data_file_;
+};
+
 static void TestRecordingApps(const std::string& app_name) {
   // Bring the app to foreground to avoid no samples.
   ASSERT_TRUE(Workload::RunCmd({"am", "start", app_name + "/.MainActivity"}));
